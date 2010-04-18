@@ -1,0 +1,74 @@
+#!/usr/bin/perl
+use Tree::MultiNode;
+use Storable qw(nstore retrieve);
+use Getopt::Long;
+use Data::Dump qw(pp);
+use JSON::XS;
+use File::Slurp;
+use AnyEvent::CouchDB;
+use Config::Tiny;
+use Unicode::String qw(utf8 latin1);
+
+#    This file is part of INE4all.
+#
+#    INE4all is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    INE4all is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with INE4all.  If not, see <http://www.gnu.org/licenses/>.
+#
+#    Find more information about INE4all in
+#    http://DatosEnCrudo.org/abredatos/
+
+my %opt;
+GetOptions(
+	\%opt,
+	'debug!',
+);
+
+my $tree = new Tree::MultiNode;
+my $file = shift(@ARGV);
+$tree = retrieve($file);
+pp($tree) if($opt{'debug'});
+$handle = new Tree::MultiNode::Handle($tree);
+
+my $jdata = {'data'=>'INEbase',attributes=>{'id'=>'ROOT'},'children'=>[]};
+$handle->top();
+$jdata = build_json($handle,$jdata);
+pp($jdata) if($opt{'debug'});
+my $json = JSON::XS->new();
+write_file('index.json',$json->encode($jdata));
+
+sub build_json {
+	my($handle,$data,$path)=@_;
+	$path||=[];
+	my $ref = $handle->get_value();
+	my $id = $handle->get_key() || int(0xFFFF*rand());
+	$data->{attributes} = {
+		'id' => $id,
+#		'path' => $path,
+	};
+	if(-f "px/$id") {
+		$data->{'attributes'}->{'rel'}='file';
+	}
+	$data->{data} = latin1($ref->{name})->utf8() || 'VisualINE';
+	if(scalar keys %{$ref->{datasets}}) {
+		# should move dataset nodes from parent to self
+	}
+	for(my $i=0; $i<scalar($handle->children()); ++$i) {
+		$handle->down($i);
+		my $cid = $handle->get_key();
+		$cdata = {};
+		push @{$data->{children}}, $cdata;
+		build_json($handle,$cdata,[@{$path},$id]);
+		$handle->up();
+	}
+	return $data;
+}

@@ -1,0 +1,182 @@
+#!/usr/bin/perl
+use strict;
+use Carp;
+use Text::CSV_XS;
+use File::Slurp;
+use Data::Dump qw(pp);
+use JSON::Any;
+use File::Spec;
+use Encode qw(from_to);
+use Unicode::String;
+use Config::Tiny;
+use AnyEvent::CouchDB;
+use Getopt::Long;
+
+#    This file is part of INE4all.
+#
+#    INE4all is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    INE4all is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with INE4all.  If not, see <http://www.gnu.org/licenses/>.
+#
+#    Find more information about INE4all in
+#    http://DatosEnCrudo.org/abredatos/
+
+# List of keys to force into arrays
+# We'll set STUB and HEADING as arrays to iterate easily over their values
+# and make life easier for FE devs
+my @FORCE_ARRAY = qw(STUB HEADING);
+
+my %opt;
+GetOptions(\%opt,
+	'config=s',
+	'debug!',
+	'force-utf8!',
+	'dry-run!',
+	'update!',
+	'n!',
+	'help!',
+);
+my %FORCE_ARRAY_FOR = map { $_ => 1 } @FORCE_ARRAY;
+my $csv = Text::CSV_XS->new({
+	'binary' => 1,
+});
+my $json = JSON::Any->new();
+my $config = Config::Tiny->read($opt{'config'}||'config.ini') || die("Error reading configuration file");
+my $couch = couch($config->{couchdb}->{url});
+my $db = $couch->db($config->{couchdb}->{database});
+# AnyEvent::CouchDB will perform latin1 to utf8 translation
+my $charset = $opt{'force-utf8'} ? 'utf8' : 'iso-8859-1';
+my $debug = $opt{'debug'};
+my $dry = $opt{'dry-run'} || $opt{'n'};
+my $destdir = $opt{'destdir'}||'js';
+print pp($config) if($debug);
+if($opt{'help'}||!@ARGV) {
+	print <<EOH;
+Usage: $0 <pxfile> [<pxfile> ..]
+EOH
+	exit(0);
+}
+mkdir($destdir);
+
+foreach my $file (@ARGV) {
+	my($data,@buffer);
+	my $text = read_file($file);
+	# This is the right place to perform charset conversion
+	from_to($text,'cp437',$charset);
+	# Get rid of MSDOS LFs
+	$text=~s,[\r],,igs;
+	# Escape newlines
+	$text=~s,"\n","<nl>",igs;
+	# Join consecutive lines
+	$text=~s,\n",",igs;
+	foreach my $line (split(/\n/,$text)) {
+		my($ref);
+		$line=~s,;$,,;
+		if($line=~m,=,) {
+			# KEY=val
+			my($key,$val)=split(/=/,$line,2);
+			$val=~s,"<nl>",\n,igs;
+			my @val;
+			if($csv->parse($val)) {
+				@val = $csv->fields();
+			} else {
+				@val = ($val);
+			}
+			if( $FORCE_ARRAY_FOR{$key} || (scalar(@val)>1) ) {
+				$ref = \@val;
+			} else {
+				$ref = shift @val;
+			}
+			$key=~tr/-/_/;
+			if($key=~s,^(\w+)\(,$1\[,) {
+				$key=~s,\)$,\],;
+			}
+			if($key=~m,(.*?)\[(.*?)\],) {
+				# key indirection KEY("SUBKEY")=...
+				my($k,$ind)=($1,$2);
+				if($csv->parse($ind)) {
+					# Handle KEY("a") and KEY("a","b","c")
+					my @ind = $csv->fields();
+					if($data->{$k} && (ref($data->{$k}) ne 'HASH')) {
+						my $sk = uc(shift @ind);
+						$sk=~s,\W,_,igs;
+						$data->{$k.'_'.$sk} = $ref;
+					} else {
+						if(@ind>1) {
+							# KEY("a","b","c")
+							print "ind=".pp(\@ind)."\n" if($debug);
+							for(@ind) {
+								# nasty hack for arbitrary-length indirection
+								my $assign = '$data->{$k}'.join('',(map{'->{"'.$_.'"}'}@ind)).'=$ref;';
+								print "eval($assign)\n" if($debug);
+								eval($assign);
+							}
+						} else {
+							# KEY("a")
+								$data->{$k}->{shift @ind} = $ref;
+						}
+					}
+				} else {
+					# csv parse error
+					$data->{$1}->{$2} = $ref;
+				}
+			} else {
+				# KEY=...
+				if($key eq 'DATA') {
+					# DATA= should clean up $data->{DATA}
+					$data->{$key} = [];
+				} elsif($key eq 'LAST_UPDATED') {
+					# Convert date to ISO-8601 format
+					my($day,$month,$year)=split(/[-\/]/,$ref);
+					$year = $year<100 ? 2000+$year : $year;
+					$data->{$key} = sprintf("%04d-%02d-%02d",$year,$month,$day);
+				} elsif($key eq 'CREATION_DATE') {
+					# Convert date to ISO-8601 format
+					my($ymd,$hour,$min)=split(/[-\/ :]/,$ref);
+					my($year,$month,$day)=(substr($ymd,0,4),substr($ymd,4,2),substr($ymd,6,2));
+					$data->{$key} = sprintf("%04d-%02d-%02d %02d:%02d:%02d",$year,$month,$day,$hour,$min,0);
+				} else {
+					$data->{$key} = $ref;
+				}
+			}
+		} else {
+			# data, most likely
+			$line=~s,["],,igs;
+			push @buffer, $line;
+		}
+	}
+	# TODO: Simplistic routine, works for now but should be updated to handle multidimensional data
+	foreach my $line (@buffer) {
+		push @{$data->{DATA}}, [split(/ /,$line)];
+	}
+	print pp($data) if($debug);
+	my($dvol,$ddir,$id) = File::Spec->splitpath($file);
+	print "id=$id\n";
+	$data->{'_id'}=$id;
+	$data->{'type'}='px';
+	my $js = $json->encode($data);
+	print($js) if($debug);
+	if(!$dry) {
+		# Keep the _rev field to update existing doc
+		eval { 
+			my $saved = $db->open_doc($id)->recv();
+			$data->{_rev} = $saved->{_rev};
+		};
+		eval {
+			my $cv = $db->save_doc($data)->recv();
+		};
+		if($@) {
+			warn "Error updating $id: ".pp($@);
+		}
+		write_file($destdir.'/'.$id, $js);
+	}
+}

@@ -1,0 +1,221 @@
+#!/usr/bin/perl
+use Tree::MultiNode;
+use WWW::Mechanize;
+use Data::Dumper;
+use Digest::MD5 qw(md5_hex);
+use URI::Escape;
+use Storable qw(nstore retrieve);
+use Getopt::Long;
+use Data::Dump qw(pp);
+use JSON::XS;
+use File::Slurp;
+
+#    This file is part of INE4all.
+#
+#    INE4all is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    INE4all is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with INE4all.  If not, see <http://www.gnu.org/licenses/>.
+#
+#    Find more information about INE4all in
+#    http://DatosEnCrudo.org/abredatos/
+
+my %opt;
+GetOptions(
+	\%opt,
+	'retrieve=s',
+	'store=s',
+	'incremental-store=s',
+);
+
+my $mech = WWW::Mechanize->new();
+my $tree = new Tree::MultiNode;
+my $handle = new Tree::MultiNode::Handle($tree);
+
+if(my $file = $opt{'retrieve'}) {
+	$tree = retrieve($file);
+	$handle = new Tree::MultiNode::Handle($tree);
+} else {
+
+my @LEVEL=qw(diezcarne diez diezboldine N2);
+my %LEVEL;
+for(my $i=0;$i<@LEVEL;++$i) {
+	$LEVEL_FOR{$LEVEL[$i]}=$i;
+}
+mkdir('html');
+mkdir('px');
+die("Can't create cache dirs") unless (-d 'html' && -d 'px');
+
+$mech->get('http://www.ine.es/inebmenu/indice.htm');
+my $html = $mech->content();
+my($table,@data);
+$html=~m,(<table summary="Tabla con la lista completa.*?</table>),igs;
+$table=$1 || die("Did not get expected content");
+my @td = $table=~m,(<td.*?</td>),igs;
+my(@level,$first,$n);
+unshift @level, $LEVEL[0];
+foreach my $td (@td) {
+	++$n;
+	print "\n";
+	my($class,$href,$name);
+	$td=~s,[\n\r],,igs;
+	$td=~s,\s+, ,igs;
+	$class=$1 if($td=~m,<td class="(.*?)",i);
+	if($td=~m,<a href="(.*?)">(.*?)</a>,igs) {
+		$href=$1,
+		$name=$2;
+	}
+	if(!$name) {
+		if($td=~m,<td.*?>(.*?)</td>,igs) {
+			$name=$1;
+			$name=~s,(<.*?>),,igs;
+		}
+	}
+	print join(":",$LEVEL_FOR{$class},$class,$href,$name),"\n";
+	print join("<-",@level),"\n";
+	my $head = $level[0];
+	$handle->last();
+	if($head eq $class) {
+		# leave current untouched
+	} else {
+		if($LEVEL_FOR{$class}<$LEVEL_FOR{$head}) {
+			if(@level) {
+				do {
+					shift @level;
+					$handle->up();
+					print "Level up\n";
+				} until(@level && ($LEVEL_FOR{$level[0]}<=$LEVEL_FOR{$class}));
+			}
+		} else {
+			print "Level down\n";
+			$handle->down();
+			unshift @level, $class;
+		}
+		
+	}
+	print join("<-",@level),"\n";
+	my $id;
+	if(!$href) {
+		$id = md5_hex($name);
+	} else {
+		if($href=~m,path=(.*?)&,) {
+			$id = uri_unescape($1);
+			$id=~s,^/,,g;
+			$id=~s,/,-,g;
+		} else {
+			$id = md5_hex($href);
+		}
+	}
+
+	my $datasets = {};
+	if($href=~m,type=pcaxis,) {
+		get_pcaxis($href,$datasets,2);
+	}
+	my $data = {'name'=>$name,'href'=>$href,'datasets'=>$datasets };
+	$handle->add_child($id,$data);
+
+	if(scalar keys %{$datasets}) {
+		foreach my $id (keys %{$datasets}) {
+			$handle->add_child($id,{name=>$datasets->{$id}});
+		}
+	}
+	# Incremental store
+	if(my $file = $opt{'incremental-store'}) {
+		nstore($tree,$file);
+	}
+
+}
+#	print Dumper($tree);
+	$handle->top();
+	if(my $file = $opt{'store'}) {
+		nstore($tree,$file);
+	}
+}
+
+
+my $jdata = {'data'=>'INEbase',attributes=>{'id'=>'ROOT'},'children'=>[]};
+$handle->top();
+build_json($handle,$jdata);
+pp($jdata);
+my $json = JSON::XS->new();
+write_file('index.json',$json->encode($jdata));
+
+sub build_json {
+	my($handle,$data,$path)=@_;
+	$path||=[];
+	my $ref = $handle->get_value();
+	my $id = $handle->get_key();
+	print "Recursed into $id\n";
+	$data->{attributes} = {
+		'id' => $id,
+		'path' => $path,
+	};
+	$data->{data} = $ref->{name};
+	for(my $i=0; $i<scalar($handle->children()); ++$i) {
+		$handle->down($i);
+		$cdata = {};
+		push @{$data->{children}}, $cdata;
+		build_json($handle,$cdata,[@{$path},$id]);
+		pp($data);
+		$handle->up();
+	}
+}
+
+exit;
+
+
+sub get_pcaxis {
+	my($url,$info,$maxdepth)=@_;
+	print "Trying to get ". ref($url) eq 'WWW::Mechanize::Link' ? $url->url() : $url, "\n";
+	$mech->get($url);
+	my $content = $mech->content();
+	my $urlfile = $url;
+	$urlfile=~s,/,-,igs;
+	$mech->save_content("html/$urlfile");
+	foreach my $link (
+		$mech->find_all_links(url_regex=>qr/\d+.px$/)
+	) {
+		my $px = $link->url();
+		my $pxfile = $px;
+		$pxfile=~s,^(.*/),,;
+		my $file = $px;
+		$file=~s,/+,/,igs;
+		$file=~s,^/,,igs;
+		$file=~s,/,-,igs;
+		$file=~s,^pcaxisdl-,,igs;
+		$file=~s,\.px$,,igs;
+		my $name = $file;
+		if($content=~m,<a.*?href=".*?file=$pxfile&.*?".*?>(.*?)</a>,igs)  {
+			$name = $1;
+			$name=~s,[\n\r],,igs;
+			$name=~s,\s+, ,igs;
+			$name=~s,^\s+,,igs;
+			$name=~s,\s+$,,igs;
+		}
+		print "Got name $name\n";
+		$info->{$file} = $name;
+		if(-f "px/$file") {
+			print "$file already exists";
+		} else {
+			print "Getting $px -> $file\n";
+			$mech->get($px);
+			$mech->save_content("px/$file");
+		}
+	}
+	if($maxdepth>0) {
+		foreach my $link (
+			$mech->find_all_links(url_regex=>qr/type=pcaxis/i)
+		) {
+			get_pcaxis($link,$info,$maxdepth-1);
+		}
+	}
+}
+
